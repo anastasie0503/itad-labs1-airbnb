@@ -1,0 +1,113 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": ["# Профилирование и качество данных Airbnb\n", "\n", "**ЛР № 3. Исправленная версия**"]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import duckdb\n",
+    "import os\n",
+    "\n",
+    "# Настройки подключения из .env (без дублирования)\n",
+    "s3_key = os.getenv('S3_ACCESS_KEY', 's3admin')\n",
+    "s3_secret = os.getenv('S3_SECRET_KEY', 's3admin123')\n",
+    "s3_endpoint = os.getenv('S3_ENDPOINT', 'localhost:8333')\n",
+    "\n",
+    "con = duckdb.connect()\n",
+    "con.execute(\"INSTALL httpfs; LOAD httpfs;\")\n",
+    "con.execute(f\"CREATE SECRET seaweed (TYPE s3, KEY_ID '{s3_key}', SECRET '{s3_secret}', ENDPOINT '{s3_endpoint}', URL_STYLE 'path', USE_SSL false);\")\n",
+    "\n",
+    "raw_path = 's3://raw/nyc-airbnb-listings/ingested_on=2026-11-03/listings.csv'\n",
+    "staging_path = 's3://staging/nyc-airbnb-listings/source_ingested_on=2026-11-03/staging.parquet'\n",
+    "quarantine_path = 's3://staging/nyc-airbnb-listings/source_ingested_on=2026-11-03/quarantine.parquet'"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": ["## Шаг 2. Доработанный профиль данных"]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "print(\"1. Типы полей:\")\n",
+    "for row in con.execute(f\"DESCRIBE SELECT id, price, neighbourhood_group, availability_365 FROM read_csv_auto('{raw_path}')\").fetchall():\n",
+    "    print(row)\n",
+    "\n",
+    "print(\"\\n2. Пропуски в price:\")\n",
+    "print(con.execute(f\"SELECT COUNT(*) as total, SUM(CASE WHEN price IS NULL THEN 1 ELSE 0 END) as nulls FROM read_csv_auto('{raw_path}')\").fetchall())\n",
+    "\n",
+    "print(\"\\n3. Дубликаты по id:\")\n",
+    "print(con.execute(f\"SELECT id, COUNT(*) FROM read_csv_auto('{raw_path}') GROUP BY id HAVING COUNT(*) > 1 LIMIT 3\").fetchall())\n",
+    "\n",
+    "print(\"\\n4. Распределение по районам:\")\n",
+    "for row in con.execute(f\"SELECT neighbourhood_group, COUNT(*) FROM read_csv_auto('{raw_path}') GROUP BY 1 ORDER BY 2 DESC\").fetchall():\n",
+    "    print(row)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": ["## Шаг 3. Пять проверок качества"]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "print(\"1. unique_id (дубликаты):\", con.execute(f\"SELECT COUNT(*) FROM (SELECT id FROM read_csv_auto('{raw_path}') GROUP BY id HAVING COUNT(*) > 1)\").fetchone()[0])\n",
+    "print(\"2. valid_room_type (неверный тип):\", con.execute(f\"SELECT COUNT(*) FROM read_csv_auto('{raw_path}') WHERE room_type NOT IN ('Entire home/apt', 'Private room', 'Shared room', 'Hotel room')\").fetchone()[0])\n",
+    "print(\"3. valid_availability (дней вне 0-365):\", con.execute(f\"SELECT COUNT(*) FROM read_csv_auto('{raw_path}') WHERE availability_365 < 0 OR availability_365 > 365\").fetchone()[0])\n",
+    "print(\"4. not_null_price (пропуски цены):\", con.execute(f\"SELECT COUNT(*) FROM read_csv_auto('{raw_path}') WHERE price IS NULL\").fetchone()[0])\n",
+    "print(\"5. positive_price (отрицательные цены):\", con.execute(f\"SELECT COUNT(*) FROM read_csv_auto('{raw_path}') WHERE price < 0\").fetchone()[0])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": ["## Шаг 4. Запись staging и карантина (с сохранением NULL)"]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "con.execute(f\"COPY (SELECT *, 'neg_price' as rule_id, 'Negative price' as reason FROM read_csv_auto('{raw_path}') WHERE price < 0) TO '{quarantine_path}' (FORMAT PARQUET);\")\n",
+    "con.execute(f\"COPY (SELECT *, CASE WHEN price IS NULL THEN true ELSE false END as flag_null_price, CASE WHEN availability_365 < 0 OR availability_365 > 365 THEN true ELSE false END as flag_invalid_availability FROM read_csv_auto('{raw_path}') WHERE price >= 0 OR price IS NULL) TO '{staging_path}' (FORMAT PARQUET);\")\n",
+    "print(\"Сохранено\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": ["## Шаг 5. Проверка баланса строк"]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "raw_c = con.execute(f\"SELECT COUNT(*) FROM read_csv_auto('{raw_path}')\").fetchone()[0]\n",
+    "stg_c = con.execute(f\"SELECT COUNT(*) FROM read_parquet('{staging_path}')\").fetchone()[0]\n",
+    "qtn_c = con.execute(f\"SELECT COUNT(*) FROM read_parquet('{quarantine_path}')\").fetchone()[0]\n",
+    "print(f\"Raw: {raw_c}, Staging: {stg_c}, Quarantine: {qtn_c}\")\n",
+    "print(f\"Баланс сходится: {raw_c == stg_c + qtn_c}\")"
+   ]
+  }
+ ],
+ "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}},
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
