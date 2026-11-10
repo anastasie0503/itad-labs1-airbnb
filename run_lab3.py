@@ -1,0 +1,62 @@
+import duckdb
+
+con = duckdb.connect()
+con.execute("INSTALL httpfs; LOAD httpfs;")
+con.execute("""
+CREATE SECRET seaweed (
+    TYPE s3,
+    KEY_ID 's3admin',
+    SECRET 's3admin123',
+    ENDPOINT 'seaweedfs:8333',
+    URL_STYLE 'path',
+    USE_SSL false
+);
+""")
+
+raw_path = 's3://raw/nyc-airbnb-listings/ingested_on=2026-11-03/listings.csv'
+print(f"Читаем данные из: {raw_path}")
+
+print("\n--- Профиль данных ---")
+total_rows = con.execute(f"SELECT COUNT(*) FROM read_csv_auto('{raw_path}')").fetchone()[0]
+print(f"Всего строк: {total_rows}")
+
+print("\nСхема данных (первые 5 полей):")
+schema = con.execute(f"DESCRIBE SELECT * FROM read_csv_auto('{raw_path}')").fetchall()
+for col in schema[:5]:
+    print(f"  {col[0]} ({col[1]})")
+
+print("\nПропуски в ключевых полях:")
+nulls = con.execute(f"""
+    SELECT 
+        COUNT(*) FILTER (WHERE price IS NULL) as null_price,
+        COUNT(*) FILTER (WHERE neighbourhood_group IS NULL) as null_neighbourhood
+    FROM read_csv_auto('{raw_path}')
+""").fetchone()
+print(f"  price: {nulls[0]} пропусков")
+print(f"  neighbourhood_group: {nulls[1]} пропусков")
+
+print("\n--- Проверка правил качества ---")
+bad_prices = con.execute(f"SELECT COUNT(*) FROM read_csv_auto('{raw_path}') WHERE price < 0").fetchone()[0]
+print(f"Правило 'positive_price': Найдено отрицательных цен: {bad_prices}")
+
+print("\n--- Сохранение данных ---")
+staging_path = 's3://staging/nyc-airbnb-listings/source_ingested_on=2026-11-03/staging.parquet'
+quarantine_path = 's3://staging/nyc-airbnb-listings/source_ingested_on=2026-11-03/quarantine.parquet'
+
+con.execute(f"""
+    COPY (
+        SELECT *, 'non_positive_price' as quality_rule_ids, 'Price is negative' as quarantine_reason
+        FROM read_csv_auto('{raw_path}')
+        WHERE price < 0
+    ) TO '{quarantine_path}' (FORMAT PARQUET);
+""")
+
+con.execute(f"""
+    COPY (
+        SELECT * 
+        FROM read_csv_auto('{raw_path}')
+        WHERE price >= 0
+    ) TO '{staging_path}' (FORMAT PARQUET);
+""")
+
+print("Данные успешно сохранены в staging и quarantine!")
